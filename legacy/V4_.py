@@ -5,7 +5,7 @@ import os
 import sys
 
 VERSION = "4.4"
-BUILD_TAG = "hysteresis-overgrowth-fix"  # change this string every time this
+BUILD_TAG = "otsu-line-exclusion-fix"  # change this string every time this
                                                  # file changes, so it's obvious at a
                                                  # glance (printed every run, no need
                                                  # to compare wording by eye) whether
@@ -122,93 +122,6 @@ BUILD_TAG = "hysteresis-overgrowth-fix"  # change this string every time this
 #        Regression-tested against every previously-working photo (no
 #        change in any of their numbers) plus this one (0 -> 1 correct
 #        aggregate, line no longer miscounted).
-#
-#        hysteresis_edge_recovery (same V4.4, real-photo motivated): a
-#        measured case showed a real, physically-attached wispy/translucent
-#        edge reading ~82 raw grayscale (true distant background ~59) -
-#        clearly above background, but getting erased by illumination
-#        flattening (the local blur average near a bright core gets pulled
-#        upward by the core itself, so the edge looks "about average" after
-#        flattening and never reaches the single global Otsu threshold).
-#        Confirmed by direct pixel measurement, not assumed.
-#        FIX: two-threshold hysteresis, same principle as Canny edge
-#        linking. The existing flattened-Otsu pipeline is untouched and
-#        still produces the confident "core" mask. Separately, a LOOSE
-#        threshold is computed on the RAW (unflattened) grayscale image -
-#        specifically raw_background_mean + LOOSE_THRESHOLD_STD_MULTIPLIER
-#        * raw_background_std, using this same photo's own background
-#        pixels (core regions and the calibration line excluded) - so it
-#        adapts per photo instead of using one fixed brightness constant.
-#        Starting from the core mask, any pixel that passes this loose
-#        threshold AND is connected (8-connectivity) back to the core,
-#        directly or through a chain of other newly-included pixels, is
-#        grown into the final mask (cv2.connectedComponents-based
-#        reconstruction - pixels not reachable from a real core are never
-#        included, so isolated dust/noise that happens to pass the loose
-#        threshold on its own is not pulled in). The calibration line's
-#        exclusion (both the padded geometric box and the "whatever blob
-#        touches the line's center" check) is re-applied after growth, so
-#        the line can never be grown into. Existing holes are protected
-#        from being grown over. Result visualization now shows core pixels
-#        in green/orange (as before) and hysteresis-recovered pixels
-#        tinted cyan, so a human can always see how much of the final area
-#        came from growth vs. the confident core; per-aggregate
-#        core/recovered/total area is also printed. When the loose
-#        threshold finds nothing new to grow (no wispy edge present), the
-#        grown mask is pixel-identical to the old core mask, so
-#        previously-working photos are unaffected - verified directly
-#        against real photos spanning black/green/blue backgrounds, not
-#        just the one photo that motivated the fix.
-#
-#        hysteresis_overgrowth_fix (same V4.4, found testing a real photo):
-#        the hysteresis feature above overgrew on a real test image - the
-#        cyan growth region swallowed several nearby round bubbles and
-#        background texture around the aggregate perimeter, not just the
-#        intended wispy edge fringe.
-#        FIRST ATTEMPT (partially wrong, kept here since it's the reasoning
-#        trail): assumed the loose threshold itself was too permissive and
-#        tightened LOOSE_THRESHOLD_STD_MULTIPLIER 2.0 -> 3.0. Tested
-#        directly against the same photo before accepting it, and that
-#        exposed the assumption was wrong - hysteresis-recovered area on
-#        that photo dropped to ~0.0mm2 total, not just the bad growth, and
-#        the small independently-verified real recoveries from the original
-#        fix disappeared too. A blunter threshold isn't what was needed.
-#        ACTUAL ROOT CAUSE (confirmed by testing, not assumed): in a
-#        densely packed photo with hundreds of separate, already-confirmed
-#        aggregates sitting close together, the growth-distance cap
-#        (below) only stopped a blob from growing into empty space - it
-#        never stopped two DIFFERENT confirmed aggregates near each other
-#        from bridging into one blob through a short chain of
-#        loose-passing pixels, since each aggregate's own allowed zone
-#        could still reach its neighbor. That's what produced one runaway
-#        ~11mm2 merged blob out of dozens of small, separate aggregates -
-#        a chain-merging bug, not a bubble-detection or threshold problem.
-#        REAL FIX: build_growth_distance_cap() now tracks, per pixel, how
-#        many different confirmed aggregates' allowed zones reach it. A
-#        pixel claimed by more than one is contested ground between two
-#        different real objects, not one object's own fringe, and is
-#        excluded from growth for everyone. LOOSE_THRESHOLD_STD_MULTIPLIER
-#        was reverted to 2.0 once this was in place - tested directly:
-#        0 merges, 0 overgrowth flags, and genuine small-scale recovery
-#        (largest single aggregate ~1.7mm2, not bubble/cluster-scale)
-#        survives on the same photo.
-#        ALSO ADDED (still needed, addresses a different failure mode):
-#        bubble exclusion via Hough circle detection on the raw grayscale -
-#        catches round bubbles even where they aren't a chain of several
-#        small confirmed aggregates (so the per-core territory rule above
-#        wouldn't otherwise apply to them). Any detected circle that isn't
-#        mostly already inside a confirmed core is excluded from growth.
-#        Detection runs on a downscaled copy (BUBBLE_DETECTION_MAX_DIMENSION)
-#        for speed - full multi-megapixel photos made this impractically
-#        slow otherwise; coordinates are scaled back up, so this only
-#        affects runtime, not which circles get found.
-#        ALSO ADDED: an overgrowth flag - if hysteresis-recovered area for
-#        one aggregate exceeds OVERGROWTH_RATIO (50%) of its own core area,
-#        it's drawn with a thick red outline and a "!" label plus a
-#        printed warning, instead of looking identical to a clean result.
-#        Re-tested against the photo that showed the bubble/chain-merge
-#        failure (0 merges now) and against the black/green/blue background
-#        photos used to validate the original hysteresis fix.
 # =============================================
 
 # =============================================
@@ -422,70 +335,8 @@ BORDERLINE_AREA_MM2 = 0.05  # true noise floor - nothing below this is even
                               # reported, let alone counted (single/few-pixel
                               # JPEG artifacts, not real candidates either way)
 
-# --- Hysteresis edge recovery (recovers real-but-faint boundary pixels the
-#     flattened Otsu threshold misses near a bright core) ---
-# The loose threshold is computed fresh per photo as
-# raw_background_mean + LOOSE_THRESHOLD_STD_MULTIPLIER * raw_background_std
-# (background = non-core, non-calibration-line pixels of the RAW,
-# unflattened grayscale image) - not a fixed brightness constant, so it
-# adapts to each photo's own lighting/background instead of being tuned to
-# one test image.
-# OVERGROWTH FIX (real-photo motivated, see changelog): first suspected the
-# threshold itself was too permissive and tried tightening this to 3.0 -
-# tested directly against the same photo and that made almost ALL
-# recovery vanish (0.0mm2, not just the bad growth), because the real
-# cause wasn't threshold permissiveness at all: in a densely packed photo,
-# hundreds of separate, already-confirmed aggregates sitting close
-# together could get bridged into one another by hysteresis, regardless of
-# how strict the brightness cutoff was. Reverted to 2.0 once
-# build_growth_distance_cap() below was fixed to stop that bridging
-# directly - confirmed on the same photo: 0 merges, 0 overgrowth flags,
-# and genuine small-scale recovery (max single aggregate 1.7mm2, not
-# bubble/cluster-scale) survives. Printed every run (background mean/std +
-# the resulting threshold) so a bad call is visible instead of silent.
-LOOSE_THRESHOLD_STD_MULTIPLIER = 2.0
-
-# Growth from any one core blob can only reach this many times that blob's
-# own equivalent radius (sqrt(area/pi)) further out. On its own this only
-# stops growth into empty space - it does NOT stop two separate confirmed
-# aggregates sitting close together from bridging into one blob, since
-# each one's own allowed zone can still reach the other. That was the
-# actual cause of an ~11mm2 runaway merge on a real densely-packed photo,
-# not raw threshold permissiveness (see LOOSE_THRESHOLD_STD_MULTIPLIER
-# note above). build_growth_distance_cap() also excludes any pixel claimed
-# by more than one core's allowed zone, so contested ground between two
-# different real objects is never grown into by either.
-GROWTH_MAX_RADIUS_MULTIPLIER = 1.5
-
-# --- Bubble exclusion (Hough circle detection on the raw grayscale) ---
-# Bubbles are near-circular and can sit directly against or overlap an
-# aggregate's edge - without this, hysteresis growth has no concept of
-# "this is a different object" and will happily swallow one whole.
-# Radius search range is relative to the image's shorter dimension (scales
-# with resolution, not a fixed pixel count), matching how every other
-# kernel size in this pipeline already scales.
-BUBBLE_MIN_RADIUS_FRACTION = 0.006
-BUBBLE_MAX_RADIUS_FRACTION = 0.06
-# Hough circle detection is run on a downscaled copy for speed (full
-# multi-megapixel photos make it very slow); this only affects performance,
-# not which circles get found, since BUBBLE_*_RADIUS_FRACTION and the
-# detected circles are scaled back to full-resolution coordinates.
-BUBBLE_DETECTION_MAX_DIMENSION = 1000
-# A detected circle mostly inside the confirmed core is assumed to be part
-# of the aggregate itself (e.g. a round aggregate), not a separate bubble -
-# only circles that are NOT mostly core get excluded.
-BUBBLE_CORE_OVERLAP_MAX = 0.3
-
-# If an aggregate's hysteresis-recovered area exceeds this fraction of its
-# own core area, the result is flagged as suspicious growth (red outline +
-# printed warning) instead of being silently accepted - same principle as
-# the existing orange/asterisk borderline-area flag.
-OVERGROWTH_RATIO = 0.5
-
 # BGR draw colors, just for the calibration overlay visualization
 DRAW_COLORS = {'RED': (0, 0, 255), 'GREEN': (0, 255, 0), 'BLUE': (255, 0, 0)}
-HYSTERESIS_COLOR_BGR = (255, 255, 0)  # cyan tint for grown-in pixels
-OVERGROWN_COLOR_BGR = (0, 0, 255)     # red outline for flagged/suspicious growth
 
 
 # =============================================
@@ -496,144 +347,6 @@ def make_odd(n):
     """Gaussian blur kernels must be odd-sized."""
     n = int(n)
     return n if n % 2 == 1 else n + 1
-
-
-def classify_contours(binary_mask, minimum_area_px, confident_area_px,
-                       borderline_area_px, border_artifact_area_px,
-                       mm2_per_px2, log_below_floor=False):
-    """Runs findContours + the existing area-floor/border-artifact rules on
-    a binary mask. Factored out so the pre-growth core pass and the
-    post-growth final pass apply exactly the same rules."""
-    contours, hierarchy = cv2.findContours(binary_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    outer_contours = []
-    hole_contours = []
-    small_indices = set()  # counted, but below the old confident floor - gets a "*" mark
-    if hierarchy is not None:
-        for i, contour in enumerate(contours):
-            parent_idx = hierarchy[0][i][3]
-            area_px = cv2.contourArea(contour)
-            if parent_idx == -1:
-                if area_px > border_artifact_area_px:
-                    pass  # border artifact, never counted
-                elif area_px > minimum_area_px:
-                    outer_contours.append((contour, i))
-                    if area_px <= confident_area_px:
-                        small_indices.add(i)
-                elif log_below_floor and area_px > borderline_area_px:
-                    # Logged even though excluded - if this still looks like
-                    # it should have counted, that's the number to check
-                    # against the photo.
-                    area_mm2 = area_px * mm2_per_px2
-                    print(f"  (below the counting floor: area={area_mm2:.4f}mm2, "
-                          f"floor is {MINIMUM_AREA_MM2}mm2)")
-            else:
-                hole_contours.append((contour, parent_idx))
-    return contours, hierarchy, outer_contours, hole_contours, small_indices
-
-
-def detect_bubble_mask(gray, seed_mask, line_exclusion_mask):
-    """Finds near-circular bubble-shaped regions via Hough circle detection on
-    the raw grayscale, so hysteresis growth can be stopped from crossing into
-    a bubble that happens to touch or overlap the aggregate core. A detected
-    circle that's mostly inside the confirmed core is assumed to be part of
-    the aggregate itself (e.g. a round aggregate), not a bubble, and is left
-    alone. See BUBBLE_* constants above for why Hough (works on circles that
-    are already touching/merged with other structure, unlike a plain
-    connected-component shape filter which fails once they've merged)."""
-    img_h, img_w = gray.shape
-    long_dim = max(img_h, img_w)
-    scale = min(1.0, BUBBLE_DETECTION_MAX_DIMENSION / long_dim)
-    small_gray = cv2.resize(gray, (max(1, int(img_w * scale)), max(1, int(img_h * scale))),
-                             interpolation=cv2.INTER_AREA) if scale < 1.0 else gray
-
-    short_dim = min(small_gray.shape)
-    min_r = max(3, int(BUBBLE_MIN_RADIUS_FRACTION * short_dim))
-    max_r = max(min_r + 1, int(BUBBLE_MAX_RADIUS_FRACTION * short_dim))
-
-    blurred_for_circles = cv2.medianBlur(small_gray, 5)
-    circles = cv2.HoughCircles(
-        blurred_for_circles, cv2.HOUGH_GRADIENT, dp=1.5, minDist=min_r,
-        param1=80, param2=30, minRadius=min_r, maxRadius=max_r
-    )
-
-    bubble_mask = np.zeros(gray.shape, dtype=np.uint8)
-    if circles is None:
-        return bubble_mask
-
-    for cx, cy, r in circles[0]:
-        # scale circle coords back up to full-resolution image space
-        cx, cy, r = cx / scale, cy / scale, r / scale
-        circle_mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.circle(circle_mask, (int(round(cx)), int(round(cy))), int(round(r)), 255, -1)
-        circle_area = np.count_nonzero(circle_mask == 255)
-        if circle_area == 0:
-            continue
-        core_overlap = np.count_nonzero((circle_mask == 255) & (seed_mask == 255))
-        if (core_overlap / circle_area) <= BUBBLE_CORE_OVERLAP_MAX:
-            bubble_mask[circle_mask == 255] = 255
-
-    bubble_mask[line_exclusion_mask == 255] = 0  # line has its own exclusion path
-    return bubble_mask
-
-
-def _dilated_crop_for_label(labels, label, stats, seed_mask_shape):
-    """Local (bounding-box-limited) dilation of one connected-component
-    label by its own GROWTH_MAX_RADIUS_MULTIPLIER x equivalent-radius cap.
-    Returns (y0, y1, x0, x1, dilated_crop) so the caller can place it back."""
-    area_px = stats[label, cv2.CC_STAT_AREA]
-    equivalent_radius = np.sqrt(area_px / np.pi)
-    cap_radius = max(3, int(round(GROWTH_MAX_RADIUS_MULTIPLIER * equivalent_radius)))
-
-    x = stats[label, cv2.CC_STAT_LEFT]
-    y = stats[label, cv2.CC_STAT_TOP]
-    w = stats[label, cv2.CC_STAT_WIDTH]
-    h = stats[label, cv2.CC_STAT_HEIGHT]
-    pad = cap_radius + 2
-    y0, y1 = max(0, y - pad), min(seed_mask_shape[0], y + h + pad)
-    x0, x1 = max(0, x - pad), min(seed_mask_shape[1], x + w + pad)
-
-    component_crop = np.where(labels[y0:y1, x0:x1] == label, 255, 0).astype(np.uint8)
-    kernel_size = 2 * cap_radius + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    dilated_crop = cv2.dilate(component_crop, kernel)
-    return y0, y1, x0, x1, dilated_crop
-
-
-def build_growth_distance_cap(seed_mask):
-    """Caps how far hysteresis growth can spread from each core blob, AND
-    stops growth from bridging two separate confirmed aggregates together.
-
-    Each blob may only grow up to GROWTH_MAX_RADIUS_MULTIPLIER times its own
-    equivalent radius (sqrt(area/pi)) further out. In a densely packed
-    photo, though, that alone isn't enough: if two different confirmed
-    aggregates sit close together, their own allowed zones can overlap, and
-    a short bridge of loose-passing pixels in that shared area would merge
-    them into one blob even though neither individually grew "too far" -
-    this is exactly how a real photo produced one runaway ~11mm2 merged
-    blob out of dozens of small, separate, already-confirmed aggregates.
-    A pixel claimed by more than one core's allowed zone is contested
-    ground between two different real objects, not one object's own
-    fringe, so it's excluded from growth entirely for everyone (each core
-    keeps its own unambiguous territory only)."""
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(seed_mask, connectivity=8)
-
-    claim_count = np.zeros(seed_mask.shape, dtype=np.uint8)
-    for label in range(1, num_labels):
-        if stats[label, cv2.CC_STAT_AREA] <= 0:
-            continue
-        y0, y1, x0, x1, dilated_crop = _dilated_crop_for_label(labels, label, stats, seed_mask.shape)
-        region = claim_count[y0:y1, x0:x1]
-        region[dilated_crop == 255] = np.minimum(region[dilated_crop == 255] + 1, 255)
-
-    allowed_mask = np.zeros(seed_mask.shape, dtype=np.uint8)
-    for label in range(1, num_labels):
-        if stats[label, cv2.CC_STAT_AREA] <= 0:
-            continue
-        y0, y1, x0, x1, dilated_crop = _dilated_crop_for_label(labels, label, stats, seed_mask.shape)
-        unambiguous = (dilated_crop == 255) & (claim_count[y0:y1, x0:x1] == 1)
-        allowed_mask[y0:y1, x0:x1][unambiguous] = 255
-
-    return allowed_mask
 
 
 def flatten_illumination(gray):
@@ -970,92 +683,36 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm):
             cv2.drawContours(cleaned, [c], -1, 0, -1)
     cleaned[line_exclusion_mask == 255] = 0  # geometric box too, as a floor
 
-    # ---- Core contours + holes (the trusted, flattened-Otsu anchor) ----
+    # ---- Contours + holes ----
+    contours, hierarchy = cv2.findContours(cleaned, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     minimum_area_px = MINIMUM_AREA_MM2 / mm2_per_px2
     confident_area_px = CONFIDENT_AREA_MM2 / mm2_per_px2
     borderline_area_px = BORDERLINE_AREA_MM2 / mm2_per_px2
+
+    outer_contours = []
+    hole_contours = []
+    small_indices = set()  # counted, but below the old confident floor - gets a "*" mark
     border_artifact_area_px = BORDER_ARTIFACT_AREA_FRACTION * img_h * img_w
-
-    (core_contours, core_hierarchy, core_outer_contours,
-     core_hole_contours, core_small_indices) = classify_contours(
-        cleaned, minimum_area_px, confident_area_px, borderline_area_px,
-        border_artifact_area_px, mm2_per_px2, log_below_floor=True)
-
-    # ---- Hysteresis edge recovery ----
-    # seed_mask keeps only the qualifying core blobs from `cleaned` (border
-    # artifacts and below-floor noise erased), holes left intact since we
-    # only erase whole rejected outer blobs here.
-    qualifying_core_idx = {i for _, i in core_outer_contours}
-    seed_mask = cleaned.copy()
-    if core_hierarchy is not None:
-        for i, contour in enumerate(core_contours):
-            parent_idx = core_hierarchy[0][i][3]
-            if parent_idx == -1 and i not in qualifying_core_idx:
-                cv2.drawContours(seed_mask, [contour], -1, 0, -1)
-
-    # Holes belonging to a qualifying core blob must never be grown over.
-    core_hole_mask = np.zeros(gray.shape, dtype=np.uint8)
-    for hole_contour, parent_idx in core_hole_contours:
-        if parent_idx in qualifying_core_idx:
-            cv2.drawContours(core_hole_mask, [hole_contour], -1, 255, -1)
-
-    # LOOSE threshold on the RAW (unflattened) grayscale, derived from this
-    # photo's own background statistics (core regions + calibration line
-    # excluded) - see LOOSE_THRESHOLD_STD_MULTIPLIER comment above for why.
-    raw_background_pixels = gray[(seed_mask == 0) & (line_exclusion_mask == 0)]
-    if raw_background_pixels.size > 0:
-        raw_background_mean = float(raw_background_pixels.mean())
-        raw_background_std = float(raw_background_pixels.std())
-    else:
-        raw_background_mean, raw_background_std = float(gray.mean()), float(gray.std())
-    loose_threshold = raw_background_mean + LOOSE_THRESHOLD_STD_MULTIPLIER * raw_background_std
-    print(f"  Loose threshold (hysteresis, raw): {loose_threshold:.1f}  "
-          f"(background mean {raw_background_mean:.1f} + {LOOSE_THRESHOLD_STD_MULTIPLIER} "
-          f"x std {raw_background_std:.1f})")
-
-    loose_mask = np.where(gray > loose_threshold, 255, 0).astype(np.uint8)
-    loose_mask[line_exclusion_mask == 255] = 0
-    loose_mask[core_hole_mask == 255] = 0  # never grow into a real hole
-
-    # ---- Bubble exclusion: growth must never cross into a detected bubble ----
-    bubble_mask = detect_bubble_mask(gray, seed_mask, line_exclusion_mask)
-    bubble_pixel_count = int(np.count_nonzero(bubble_mask == 255))
-    if bubble_pixel_count > 0:
-        print(f"  Bubble exclusion triggered: {bubble_pixel_count}px marked as "
-              f"bubble, excluded from hysteresis growth")
-    loose_mask[bubble_mask == 255] = 0
-
-    # ---- Growth distance cap: stop a chain of loose-passing pixels from ----
-    # propagating arbitrarily far just because a path exists (see
-    # GROWTH_MAX_RADIUS_MULTIPLIER comment above).
-    growth_allowed_mask = build_growth_distance_cap(seed_mask)
-    loose_mask[growth_allowed_mask == 0] = 0
-
-    # Standard hysteresis/connected-component reconstruction: keep only the
-    # connected components of (seed | loose) that actually touch a seed
-    # pixel, so isolated dust/noise passing the loose threshold on its own
-    # is never included.
-    union_mask = cv2.bitwise_or(seed_mask, loose_mask)
-    num_labels, labels = cv2.connectedComponents(union_mask, connectivity=8)
-    seed_labels = set(np.unique(labels[seed_mask == 255])) - {0}
-    if seed_labels:
-        grown_mask = np.where(np.isin(labels, list(seed_labels)), 255, 0).astype(np.uint8)
-    else:
-        grown_mask = seed_mask.copy()
-
-    # Re-apply both calibration-line exclusions after growth, so the line
-    # can never be grown into via the raw/loose threshold path.
-    grown_mask[line_exclusion_mask == 255] = 0
-    post_growth_contours, _ = cv2.findContours(grown_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for c in post_growth_contours:
-        if cv2.pointPolygonTest(c, line_center_point, False) >= 0:
-            cv2.drawContours(grown_mask, [c], -1, 0, -1)
-
-    # ---- Final contours + holes (core, possibly grown) ----
-    (contours, hierarchy, outer_contours,
-     hole_contours, small_indices) = classify_contours(
-        grown_mask, minimum_area_px, confident_area_px, borderline_area_px,
-        border_artifact_area_px, mm2_per_px2, log_below_floor=False)
+    if hierarchy is not None:
+        for i, contour in enumerate(contours):
+            parent_idx = hierarchy[0][i][3]
+            area_px = cv2.contourArea(contour)
+            if parent_idx == -1:
+                if area_px > border_artifact_area_px:
+                    pass  # border artifact, never counted
+                elif area_px > minimum_area_px:
+                    outer_contours.append((contour, i))
+                    if area_px <= confident_area_px:
+                        small_indices.add(i)
+                elif area_px > borderline_area_px:
+                    # Logged even though excluded - if this still looks like
+                    # it should have counted, that's the number to check
+                    # against the photo.
+                    area_mm2 = area_px * mm2_per_px2
+                    print(f"  (below the counting floor: area={area_mm2:.4f}mm2, "
+                          f"floor is {MINIMUM_AREA_MM2}mm2)")
+            else:
+                hole_contours.append((contour, parent_idx))
 
     # ---- Background mean intensity (for the relative intensity index) ----
     full_mask = np.zeros(gray.shape, dtype=np.uint8)
@@ -1097,34 +754,14 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm):
 
         volume_mm3 = true_area_mm2 * thickness_mm if thickness_mm is not None else None
 
-        # Hysteresis diagnostics: how much of this aggregate's area is the
-        # confident core vs. grown-in via the loose raw-image threshold.
-        core_area_px_count = int(np.count_nonzero((agg_mask == 255) & (seed_mask == 255)))
-        hysteresis_area_px_count = int(np.count_nonzero((agg_mask == 255) & (seed_mask == 0)))
-        core_area_mm2 = core_area_px_count * mm2_per_px2
-        hysteresis_area_mm2 = hysteresis_area_px_count * mm2_per_px2
-
-        # Overgrowth flag: don't let a suspiciously large hysteresis result
-        # look identical to a correctly-recovered one - surface it instead
-        # (same principle as the existing orange/asterisk borderline flag).
-        is_overgrown = hysteresis_area_mm2 > OVERGROWTH_RATIO * max(core_area_mm2, 1e-9)
-        if is_overgrown:
-            print(f"  WARNING: aggregate #{i + 1} hysteresis-recovered area "
-                  f"({hysteresis_area_mm2:.4f}mm2) exceeds {OVERGROWTH_RATIO * 100:.0f}% "
-                  f"of its core area ({core_area_mm2:.4f}mm2) - flagged as suspicious growth")
-
         measurements.append({
             'id': i + 1,
-            'contour_idx': contour_idx,
             'true_area_px': true_area_px,
             'true_area_mm2': true_area_mm2,
-            'core_area_mm2': core_area_mm2,
-            'hysteresis_area_mm2': hysteresis_area_mm2,
             'num_holes': len(my_holes),
             'perimeter_mm': perimeter_mm,
             'circularity': circularity,
             'is_small': contour_idx in small_indices,
-            'is_overgrown': is_overgrown,
             'center_x': center_x, 'center_y': center_y,
             'bbox_x': x, 'bbox_y': y, 'bbox_w': w, 'bbox_h': h,
             'background_mean': background_mean,
@@ -1139,39 +776,14 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm):
     # of green, so they're visibly flagged as "smaller, worth a second look"
     # right in the image itself, not just as a number in a table.
     result_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-    # Outline hysteresis-recovered pixels (grown-in, not part of the
-    # confident core) in cyan, same as the green/orange core outlines, so
-    # growth is visually distinguishable without painting over the actual
-    # photo underneath it.
-    final_mask = np.zeros(gray.shape, dtype=np.uint8)
-    for contour, _ in outer_contours:
-        cv2.drawContours(final_mask, [contour], -1, 255, -1)
-    for hc, _ in hole_contours:
-        cv2.drawContours(final_mask, [hc], -1, 0, -1)
-    hysteresis_mask = np.where((final_mask == 255) & (seed_mask == 0), 255, 0).astype(np.uint8)
-    if np.any(hysteresis_mask):
-        hysteresis_contours, _ = cv2.findContours(hysteresis_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(result_image, hysteresis_contours, -1, HYSTERESIS_COLOR_BGR, 2)
-
-    overgrown_indices = {m['contour_idx'] for m in measurements if m['is_overgrown']}
-    confident_contours = [c for c, i in outer_contours if i not in small_indices and i not in overgrown_indices]
-    small_contours = [c for c, i in outer_contours if i in small_indices and i not in overgrown_indices]
-    overgrown_contours = [c for c, i in outer_contours if i in overgrown_indices]
+    confident_contours = [c for c, i in outer_contours if i not in small_indices]
+    small_contours = [c for c, i in outer_contours if i in small_indices]
     cv2.drawContours(result_image, confident_contours, -1, (0, 255, 0), 2)
     cv2.drawContours(result_image, small_contours, -1, (0, 165, 255), 2)
-    cv2.drawContours(result_image, overgrown_contours, -1, OVERGROWN_COLOR_BGR, 4)
     cv2.drawContours(result_image, [hc for hc, _ in hole_contours], -1, (0, 0, 255), 2)
     for m in measurements:
-        if m['is_overgrown']:
-            dot_color = OVERGROWN_COLOR_BGR
-            label = f"#{m['id']}!"
-        elif m['is_small']:
-            dot_color = (0, 165, 255)
-            label = f"#{m['id']}*"
-        else:
-            dot_color = (0, 255, 255)
-            label = f"#{m['id']}"
+        dot_color = (0, 165, 255) if m['is_small'] else (0, 255, 255)
+        label = f"#{m['id']}*" if m['is_small'] else f"#{m['id']}"
         cv2.circle(result_image, (m['center_x'], m['center_y']), 6, dot_color, -1)
         cv2.putText(result_image, label, (m['bbox_x'], m['bbox_y'] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, dot_color, 2)
@@ -1182,10 +794,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm):
         'color_mode': color_mode, 'reference_mm': reference_mm,
         'line_px': line_px, 'mm_per_px': mm_per_px,
         'otsu_threshold': otsu_threshold,
-        'loose_threshold': loose_threshold,
-        'raw_background_mean': raw_background_mean,
-        'raw_background_std': raw_background_std,
-        'bubble_pixel_count': bubble_pixel_count,
         'measurements': measurements,
         'background_mean': background_mean,
         'thickness_mm': thickness_mm,
@@ -1435,13 +1043,8 @@ if __name__ == "__main__":
 
         print(f"Calibration: {result['line_px']:.0f}px = {params['reference_mm']}mm "
               f"(1px = {result['mm_per_px']:.5f}mm)")
-        print(f"Otsu threshold (core, flattened): {result['otsu_threshold']:.0f}")
-        print(f"Loose threshold (hysteresis, raw): {result['loose_threshold']:.0f}")
+        print(f"Otsu threshold: {result['otsu_threshold']:.0f}")
         print(f"Aggregates found: {len(result['measurements'])}")
-        for m in result['measurements']:
-            print(f"  #{m['id']}: core={m['core_area_mm2']:.4f}mm2  "
-                  f"hysteresis-recovered={m['hysteresis_area_mm2']:.4f}mm2  "
-                  f"total={m['true_area_mm2']:.4f}mm2")
 
         display_results(result, filename=name)
 

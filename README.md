@@ -20,9 +20,13 @@ Given one or more photos, `src/pipeline.py`:
    annotated result / measurement table), plus a batch comparison table
    with averages when more than one photo is analyzed.
 
-`src/pipeline_backlight_variant.py` is a parallel setup for a different
-physical configuration (backlit rather than reflected-light photography),
-not a further iteration of the same pipeline.
+A separate backlit-photography setup was previously maintained at
+`src/pipeline_backlight_variant.py`. It never received the bug fixes applied
+to `legacy/B1.py` (which is the script actually used for backlit-photo runs
+and the one writing `data/plasma_analysis_master_log_backlight.csv`), so it
+was archived to
+[`archive/pipeline_backlight_variant.py.OLD_DO_NOT_RUN`](archive/pipeline_backlight_variant.py.OLD_DO_NOT_RUN)
+to prevent it from being run by mistake.
 
 ## Running
 
@@ -36,14 +40,15 @@ line color, and (optionally) aggregate thickness. If a GUI can't launch, the
 script automatically falls back to the same questions asked in the terminal.
 
 ## Structure
-- `src/` — the current, canonical pipeline (`pipeline.py`) and its backlight
-  variant (`pipeline_backlight_variant.py`)
+- `src/` — the current, canonical pipeline (`pipeline.py`)
 - `tutorials/` — four standalone scripts breaking the pipeline's core ideas
   (grayscale conversion, background subtraction, thresholding, contour
   detection) into individually runnable teaching examples
 - `data/used_plasma_pic/` — reference/test photographs
 - `legacy/` — earlier pipeline iterations, kept for history rather than
   deleted; see [`legacy/README.md`](legacy/README.md) for what's there and why
+- `archive/` — abandoned/superseded scripts kept for reference only, renamed
+  with an `.OLD_DO_NOT_RUN` suffix so they can't be run by mistake
 
 ## Known limitations
 
