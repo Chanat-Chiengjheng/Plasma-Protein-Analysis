@@ -9,261 +9,46 @@ from datetime import datetime
 VERSION = "5.0"
 BUILD_TAG = "reflected-backlight-merge"
 
-# =============================================
-# CHANGELOG (quick reference)
-# =============================================
-# V5.0 - [shared] FIRST MERGED RELEASE. Combines legacy/V4_hyesteresis.py
-#        (VERSION 4.14, reflected-light) and legacy/B1.py (VERSION B1.10,
-#        backlight) into a single file with a mode selector, per the V5
-#        design document (Plasma/V5_design.md). Neither source file was
-#        deleted - both remain in legacy/ with their full changelog history
-#        intact; this file's own changelog starts fresh from here. See the
-#        design doc for the full rationale behind every decision below;
-#        only the decisions and their direct consequences are summarized
-#        here.
-#
-#        Per the design doc's Section 5 labeling convention, every entry
-#        below (and every future entry until both modes have independently
-#        passed a full real-photo validation round with no unresolved
-#        regressions - a deliberate later decision, not automatic) is
-#        tagged [shared] / [reflected] / [backlight] for what it affects.
-#
-#        [shared] Mode selector added to the popup/terminal parameter
-#        input ("Reflected Light" / "Backlight"), read once and threaded
-#        through analyze_image() and every downstream function that needs
-#        to branch on it.
-#
-#        [shared] classify_contours(), build_growth_distance_cap() /
-#        _dilated_crop_for_label() (carrying V4.14's distanceTransform perf
-#        fix - confirmed mathematically equivalent to B1's still-unfixed
-#        cv2.dilate version, so this is a pure speedup for backlight too,
-#        not a behavior change), cluster_fragments(), find_calibration_line()
-#        (aspect-ratio ceiling now a parameter, see below), get_color_mask()
-#        (now takes saturation_min/value_min as parameters either way), and
-#        flatten_illumination() (B1's version, which accepts an optional
-#        exclusion_mask) are now single, unified functions used by both
-#        modes, per design doc Section 4.
-#
-#        [reflected] Otsu-line-exclusion and the core Otsu/morphology/
-#        hysteresis pipeline are otherwise unchanged from V4.14 -
-#        THRESH_BINARY (bright-on-dark), loose threshold = raw background
-#        mean + N*std ("brighter than background"), MINIMUM_AREA_MM2 stays
-#        at V4.14's validated 0.10.
-#
-#        [backlight] Otsu/hysteresis polarity unchanged from B1.10 -
-#        THRESH_BINARY_INV (dark-on-bright), loose threshold = raw
-#        background mean - N*std ("darker than background"),
-#        MINIMUM_AREA_MM2 stays at B1.10's validated 0.14. These two floors
-#        were never the same value between the two lines (0.10 vs 0.14,
-#        each independently justified against real measured aggregates in
-#        their own changelogs) and are kept as mode-specific constants, not
-#        unified to one number - unifying them was never part of the design
-#        doc's scope and would be an unvalidated, unrequested change to
-#        real detection behavior.
-#
-#        [reflected] Adaptive HSV saturation/value floors (B1.3's
-#        compute_adaptive_hsv_floors()) were TRIED for reflected mode too,
-#        per the design doc's Section 3 row 2 candidate ("no clear reason
-#        reflected-light wouldn't also benefit") - and per the design doc's
-#        own explicit instruction, tested directly against real reflected-
-#        light photos before being trusted. THE TEST FAILED: on this
-#        session's validation set (see Section "VALIDATION" below),
-#        switching reflected mode to adaptive floors caused real,
-#        significant calibration regressions on multiple photos where
-#        V4.14's fixed floors worked correctly - not small numeric drift.
-#        Concretely: IMG_3113.JPG (a 12736.87mm2, 82-aggregate real
-#        detection under V4.14) FAILED calibration entirely under adaptive
-#        floors; IMG_3103.JPG's detected line length shifted from 1031.82px
-#        to 1438.12px (a different line was matched), losing more than half
-#        the confirmed area (128.52 -> 62.87mm2); IMG_3111.JPG and
-#        IMG_3114.JPG showed the same pattern (line_px shifting by 20-45%,
-#        confirmed area dropping or the wrong-scale line being selected).
-#        DECISION: reflected mode KEEPS V4.14's fixed SATURATION_MIN=80/
-#        VALUE_MIN=40 (unchanged, still shared constants in this file,
-#        still passed into the now-shared get_color_mask()). Adaptive
-#        floors remain BACKLIGHT-ONLY, exactly matching B1.10's own
-#        validated behavior - compute_adaptive_hsv_floors() is still called
-#        for both modes (s_ref/v_ref are useful diagnostics either way,
-#        logged to the CSV for both), but only backlight mode's
-#        saturation_min/value_min actually come from it; reflected mode's
-#        are always the fixed constants, restoring exact V4.14 calibration
-#        behavior. This is the design doc's own stated fallback if the test
-#        didn't hold up ("don't assume it transfers cleanly") - it didn't,
-#        so it wasn't adopted for reflected mode.
-#
-#        [backlight] MAX_ASPECT_RATIO (6.0, guards against the transparent-
-#        boundary chromatic-fringe artifact - see B1.1's changelog) stays
-#        backlight-only, passed as find_calibration_line()'s
-#        max_aspect_ratio parameter; reflected mode passes None (no
-#        ceiling), preserving V4.14's exact aspect-ratio behavior.
-#
-#        [shared] Bubble exclusion (Hough circle detection, previously
-#        V4-only and unconditionally ON) is now a shared function gated by
-#        ENABLE_BUBBLE_EXCLUSION, DEFAULT FALSE FOR BOTH MODES. This is a
-#        deliberate default change from V4.14's always-on behavior, per the
-#        design doc's Section 3 row 5 ("separately flagged for disable-by-
-#        default given dry sample prep is now standard"). NOT byte-
-#        identical to the V4.14 baseline by default - see validation
-#        section for the explicit with-flag-on comparison used to confirm
-#        the ported function itself is unchanged, kept separate from the
-#        intentional default-off behavior change.
-#
-#        [shared] Cluster-flagging (ENABLE_CLUSTER_FLAGGING, V4.14's
-#        redesigned always-flag-never-autocount version - see V4.14's own
-#        changelog in legacy/V4_hyesteresis.py for the full history of why
-#        this doesn't auto-count) is now available for BOTH modes, default
-#        True for both. This is BRAND NEW functionality for backlight -
-#        B1.py never had any form of fragment clustering, prototype or
-#        otherwise - so there is no backlight baseline to be byte-identical
-#        to; it is validated fresh in this session as new functionality,
-#        not a carryover. See validation section for backlight-specific
-#        cluster-candidate results.
-#
-#        [reflected] Local-contrast prototype (ENABLE_LOCAL_CONTRAST_
-#        PROTOTYPE, V4.10, default False) is carried over REFLECTED-MODE
-#        ONLY. It was never adapted or tested for backlight's inverted
-#        polarity (it looks for pixels brighter than their own local
-#        neighborhood mean - the mirror-image "darker than local mean"
-#        check backlight would need was never written or validated), and
-#        the design doc does not ask for it to be generalized as part of
-#        this merge. Gated in analyze_image() to only run when mode is
-#        'REFLECTED', regardless of the flag's value, so enabling it can
-#        never silently do the wrong thing for a backlight photo.
-#
-#        [shared] Physics formulas are NOT unified, per design doc Section
-#        3 row 4 - relative_intensity_index/combined_index (reflected) and
-#        optical_density_index/combined_optical_density (backlight) remain
-#        genuinely different measurements, computed in separate branches of
-#        the per-aggregate measurement loop. Both are carried on every
-#        measurement dict's mode-appropriate keys; display/CSV code reads
-#        whichever pair matches r['mode'].
-#
-#        [shared] CSV MASTER LOG: single new file
-#        (plasma_analysis_master_log_v5.csv, separate from both V4's and
-#        B1's existing master logs so historical rows are never mixed with
-#        merged-tool rows) with a "mode" column plus every column either
-#        source file had (reflected's avg_relative_intensity_index/
-#        total_combined_index, backlight's avg_optical_density_index/
-#        total_combined_optical_density, backlight's hsv_* adaptive-floor
-#        diagnostics - now populated for both modes since adaptive HSV is
-#        shared - and both modes' unconfirmed_cluster_count/
-#        unconfirmed_cluster_area_mm2). Whichever pair doesn't apply to a
-#        given row's mode is left blank, never populated with a
-#        placeholder/zero that could be mistaken for a real measurement.
-#
-#        VALIDATION (29 photos - every calibrated photo available in
-#        data/used_plasma_pic/ on this machine at merge time; the ~95-photo
-#        set referenced in V4.14's own validation history lives on a
-#        different machine/session and was not available here - this is a
-#        real limitation of this validation round, not hidden):
-#
-#        Part 1 (reflected mode vs V4.14, with ENABLE_BUBBLE_EXCLUSION
-#        forced True to isolate the merge itself from the separate,
-#        intentional bubble-exclusion-default-off change): 29/29 photos
-#        BYTE-IDENTICAL (confirmed count + every aggregate's true_area_mm2)
-#        to the V4.14 baseline. This run is also what caught the adaptive-
-#        HSV regression above - the first attempt (adaptive floors for
-#        reflected mode) failed 8/29 in this same comparison, all four
-#        worst cases (IMG_3103/3111/3113/3114) real calibration breaks, not
-#        noise; after reverting to fixed floors, re-ran clean at 29/29.
-#
-#        Part 1b (reflected mode, V5's actual shipped defaults - bubble
-#        exclusion OFF): 9/29 differ from the V4.14 baseline, consistent
-#        with V4.14 having bubble exclusion unconditionally on - this is
-#        the expected, disclosed shape of that default change, not
-#        re-investigated as a bug.
-#
-#        Part 2 (backlight mode vs B1.10, with ENABLE_CLUSTER_FLAGGING
-#        forced False on both sides, since B1 never had this feature and a
-#        baseline comparison needs to isolate B1's own pre-existing logic
-#        from it): 29/29 photos BYTE-IDENTICAL to the B1.10 baseline.
-#
-#        Part 3 (backlight mode, cluster-flagging ON - V5's default, brand
-#        new for backlight, no baseline to compare against): 5 of 29 photos
-#        produced at least one cluster candidate (IMG_3106.JPG,
-#        IMG_3116.JPG x2, RMonBlO_C.JPG, Test1.JPG, Test3.JPG) - all
-#        correctly flagged with the magenta "CLUSTER?" marker and excluded
-#        from every automatic tally, never auto-counted, per V4.14's
-#        established design. Not independently validated against ground-
-#        truth backlight photos with a confirmed real fragmented aggregate
-#        (no such case existed in this 29-photo set, which is why it's new
-#        functionality validated fresh rather than a byte-identical
-#        carryover) - the mechanism itself is unchanged from V4.14's own
-#        validated implementation, only newly exposed to backlight-mode
-#        masks.
-#
-#        No tracebacks/errors on any photo in either mode. Full run log
-#        available in this session's scratchpad if needed for a future
-#        session to re-check specific photos.
-# =============================================
 
 
-# =============================================
-# MODE-SPECIFIC CONSTANTS
-# =============================================
-# These are the only constants that differ by mode - everything else below
-# this section is a single shared value used identically by both. Values
-# are carried over unchanged from each mode's own validated source file
-# (V4.14 / B1.10) - see the V5.0 changelog entry above for why these are
-# deliberately NOT unified to one number.
 MINIMUM_AREA_MM2 = {'REFLECTED': 0.10, 'BACKLIGHT': 0.14}
 MAX_ASPECT_RATIO = {'REFLECTED': None, 'BACKLIGHT': 6.0}
 
-# --- Otsu thresholding ---
 BLUR_SIZE_FRACTION  = 0.0043
 MORPH_SIZE_FRACTION = 0.0009
 
-# --- Illumination flattening ---
 ILLUMINATION_KERNEL_FRACTION = 0.5
 BORDER_ARTIFACT_AREA_FRACTION = 0.9
 
-# --- Calibration line color detection (HSV) ---
-HUE_CENTERS = {'RED': 0, 'GREEN': 60, 'BLUE': 120}  # OpenCV hue scale is 0-180
+HUE_CENTERS = {'RED': 0, 'GREEN': 60, 'BLUE': 120}
 HUE_TOLERANCE  = 15
-# [reflected] Fixed floors, unchanged from V4.14 - adaptive floors were
-# tested against reflected mode and found unsafe (real calibration
-# regressions on real photos) - see V5.0 changelog for the validation
-# details. Reflected mode always uses these two constants.
 SATURATION_MIN = 80
 VALUE_MIN      = 40
-# [backlight only] Adaptive per-photo saturation/value floors (B1.3) -
-# see V5.0 changelog for why these did NOT get adopted for reflected mode.
 RELATIVE_SATURATION_FRACTION = 0.35
 RELATIVE_VALUE_FRACTION      = 0.35
 ABSOLUTE_SATURATION_FLOOR    = 30
 ABSOLUTE_VALUE_FLOOR         = 15
 
-# --- Calibration line shape filter ---
 MIN_ASPECT_RATIO         = 3.0
 MIN_LINE_LENGTH_FRACTION = 0.05
 
-# --- Aggregate noise filter (CONFIDENT/BORDERLINE are identical in both
-#     source files; MINIMUM_AREA_MM2 is mode-specific, see above) ---
 CONFIDENT_AREA_MM2 = 1.0
 BORDERLINE_AREA_MM2 = 0.05
 
-# --- Local-contrast secondary seed path (V4.10, PROTOTYPE/EXPERIMENTAL,
-#     REFLECTED MODE ONLY - see V5.0 changelog for why) ---
 ENABLE_LOCAL_CONTRAST_PROTOTYPE = False
 LOCAL_CONTRAST_KERNEL_FRACTION = 0.06
 LOCAL_CONTRAST_STD_MULTIPLIER = 3.0
 LOCAL_CONTRAST_MIN_MARGIN = 4
 LOCAL_CONTRAST_MIN_SEED_AREA_MM2 = 0.10
 
-# --- Fragment clustering / cluster flagging (V4.11-V4.14 design, now
-#     shared for both modes as of V5.0 - see changelog) ---
 ENABLE_CLUSTER_FLAGGING = True
 FRAGMENT_CLUSTER_MAX_GAP_FRACTION = 0.058
 FRAGMENT_CLUSTER_MIN_FILL_RATIO = 0.06
 FRAGMENT_CLUSTER_MAX_FRAGMENTS = 300
 
-# --- Hysteresis edge recovery ---
 LOOSE_THRESHOLD_STD_MULTIPLIER = 2.0
 GROWTH_MAX_RADIUS_MULTIPLIER = 1.5
 
-# --- Bubble exclusion (Hough circle detection) - shared function, opt-in,
-#     default OFF for both modes as of V5.0 (was unconditionally on for
-#     reflected in V4.14) - see changelog ---
 ENABLE_BUBBLE_EXCLUSION = False
 BUBBLE_MIN_RADIUS_FRACTION = 0.006
 BUBBLE_MAX_RADIUS_FRACTION = 0.06
@@ -272,19 +57,12 @@ BUBBLE_CORE_OVERLAP_MAX = 0.3
 
 OVERGROWTH_RATIO = 0.5
 
-# BGR draw colors, just for the calibration overlay visualization
 DRAW_COLORS = {'RED': (0, 0, 255), 'GREEN': (0, 255, 0), 'BLUE': (255, 0, 0)}
-HYSTERESIS_COLOR_BGR = (255, 255, 0)  # cyan tint for grown-in pixels
-OVERGROWN_COLOR_BGR = (0, 0, 255)     # red outline for flagged/suspicious growth
-CLUSTER_UNCONFIRMED_COLOR_BGR = (255, 0, 255)  # magenta - requires visual confirmation
+HYSTERESIS_COLOR_BGR = (255, 255, 0)
+OVERGROWN_COLOR_BGR = (0, 0, 255)
+CLUSTER_UNCONFIRMED_COLOR_BGR = (255, 0, 255)
 
 
-# =============================================
-# CSV MASTER LOG
-# =============================================
-# Single new file, separate from V4's plasma_analysis_master_log.csv and
-# B1's plasma_analysis_master_log_backlight.csv, so historical rows from
-# either legacy tool are never mixed with V5 rows - see V5.0 changelog.
 MASTER_CSV_FILENAME = "plasma_analysis_master_log_v5.csv"
 MASTER_CSV_DIR = r"C:\Users\66950\Desktop\Projects in github\Plasma\data"
 os.makedirs(MASTER_CSV_DIR, exist_ok=True)
@@ -295,16 +73,10 @@ CSV_COLUMNS = [
     "calibration_status", "calibration_failure_reason",
     "reference_mm", "calibration_color", "mm_per_px", "background_mean",
     "aggregate_count", "total_area_mm2", "total_holes", "avg_circularity",
-    # reflected-only headline numbers - blank on a backlight row
     "avg_relative_intensity_index", "total_combined_index",
-    # backlight-only headline numbers - blank on a reflected row
     "avg_optical_density_index", "total_combined_optical_density",
     "total_volume_mm3", "has_flagged_small_aggregate",
-    # cluster-flagging candidates (shared as of V5.0, see changelog) -
-    # never folded into aggregate_count/total_area_mm2 above.
     "unconfirmed_cluster_count", "unconfirmed_cluster_area_mm2",
-    # adaptive HSV floor diagnostics (shared as of V5.0, previously
-    # backlight-only) - populated for both modes now.
     "hsv_saturation_min", "hsv_value_min", "hsv_s_ref_p99", "hsv_v_ref_p99",
 ]
 
@@ -369,9 +141,6 @@ def append_photo_to_master_csv(filename, params, result):
         writer.writerow(row)
 
 
-# =============================================
-# ILLUMINATION FLATTENING
-# =============================================
 
 def make_odd(n):
     n = int(n)
@@ -388,8 +157,8 @@ def classify_contours(binary_mask, minimum_area_px, confident_area_px,
     contours, hierarchy = cv2.findContours(binary_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     outer_contours = []
     hole_contours = []
-    small_indices = set()  # counted, but below the confident floor - gets a "*" mark
-    rejected = []  # (area_mm2, reason) - only populated if collect_diagnostics
+    small_indices = set()
+    rejected = []
     minimum_area_mm2 = minimum_area_px * mm2_per_px2
     if hierarchy is not None:
         for i, contour in enumerate(contours):
@@ -436,7 +205,7 @@ def cluster_fragments(cleaned, minimum_area_px, border_artifact_area_px,
     for lbl in range(1, num_labels):
         area = stats[lbl, cv2.CC_STAT_AREA]
         if area > border_artifact_area_px or area > minimum_area_px:
-            continue  # already qualifies alone, or a border artifact - untouched
+            continue
         sub_floor_labels.append(lbl)
 
     if len(sub_floor_labels) < 2:
@@ -689,9 +458,6 @@ def flatten_illumination(gray, exclusion_mask=None):
     return np.clip(diff + 128, 0, 255).astype(np.uint8)
 
 
-# =============================================
-# CALIBRATION LINE DETECTION
-# =============================================
 
 def compute_adaptive_hsv_floors(hsv_image):
     """[shared as of V5.0, ported from B1.3] Derive this photo's own
@@ -715,7 +481,6 @@ def get_color_mask(hsv_image, color_mode, saturation_min, value_min):
     center = HUE_CENTERS[color_mode]
 
     if color_mode == 'RED':
-        # red wraps around the 0/180 boundary on OpenCV's hue scale
         hue_mask = (h <= HUE_TOLERANCE) | (h >= 180 - HUE_TOLERANCE)
     else:
         hue_mask = np.abs(h - center) <= HUE_TOLERANCE
@@ -764,9 +529,6 @@ def find_calibration_line(color_mask, max_aspect_ratio=None):
     return max(candidates, key=lambda c: c['length_px'])
 
 
-# =============================================
-# PARAMETER INPUT — popup first, terminal as automatic fallback
-# =============================================
 
 def get_parameters_gui():
     import tkinter as tk
@@ -956,9 +718,6 @@ def get_parameters():
         return get_parameters_terminal()
 
 
-# =============================================
-# MAIN ANALYSIS PIPELINE
-# =============================================
 
 def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
     """mode: 'REFLECTED' or 'BACKLIGHT'. See the V5.0 changelog for exactly
@@ -966,13 +725,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
     minimum_area_mm2_for_mode = MINIMUM_AREA_MM2[mode]
     max_aspect_ratio_for_mode = MAX_ASPECT_RATIO[mode]
 
-    # ---- Calibration ----
-    # [backlight] saturation_min/value_min come from compute_adaptive_hsv_
-    # floors(), same as B1.10. [reflected] saturation_min/value_min are the
-    # fixed SATURATION_MIN/VALUE_MIN constants, same as V4.14 - adaptive
-    # floors were tested and found unsafe for reflected mode, see V5.0
-    # changelog. s_ref/v_ref are computed either way, purely as CSV
-    # diagnostics - they never gate reflected-mode detection.
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     _adaptive_saturation_min, _adaptive_value_min, s_ref, v_ref = compute_adaptive_hsv_floors(hsv)
     if mode == 'BACKLIGHT':
@@ -987,11 +739,12 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
     }
 
     if line is None:
+        floor_kind = "adaptive" if mode == 'BACKLIGHT' else "fixed"
         return {'success': False, 'mode': mode, 'reason': (
             f"No {color_mode.lower()} calibration line could be confirmed.\n"
             f"Possible causes: the line isn't in frame, lighting is too poor,\n"
             f"or the wrong color was selected for this photo.\n"
-            f"(This photo's adaptive floors: saturation>={saturation_min:.0f} "
+            f"(This photo's {floor_kind} floors: saturation>={saturation_min:.0f} "
             f"[99th pct S={s_ref:.0f}], value>={value_min:.0f} [99th pct V={v_ref:.0f}])"
         ), 'hsv_diagnostics': hsv_diagnostics}
 
@@ -999,7 +752,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
     mm_per_px = reference_mm / line_px
     mm2_per_px2 = mm_per_px ** 2
 
-    # Calibration overlay for display
     cal_result = image.copy()
     overlay = cal_result.copy()
     overlay[color_mask] = DRAW_COLORS[color_mode]
@@ -1011,32 +763,23 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
                 (max(cx - 150, 10), max(cy - 30, 30)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
 
-    # ---- Grayscale + illumination flattening + blur ----
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     img_h, img_w = gray.shape
     blur_size = max(3, make_odd(BLUR_SIZE_FRACTION * min(img_h, img_w)))
     morph_size = max(2, int(round(MORPH_SIZE_FRACTION * min(img_h, img_w))))
 
-    # ---- Calibration line exclusion mask (used multiple times) ----
     line_exclusion_mask = np.zeros(gray.shape, dtype=np.uint8)
     (lcx, lcy), (lw, lh), langle = line['rect']
     padded_rect = ((lcx, lcy), (lw + 20, lh + 20), langle)
     line_box = np.int32(cv2.boxPoints(padded_rect))
     cv2.fillPoly(line_exclusion_mask, [line_box], 255)
 
-    # [reflected]/[backlight] flatten_illumination() is a shared function -
-    # only whether the exclusion mask is passed differs, preserving each
-    # mode's exact prior behavior (V4.14 never passed one; B1.10 always
-    # did) - see V5.0 changelog and flatten_illumination()'s own docstring.
     if mode == 'BACKLIGHT':
         flattened = flatten_illumination(gray, line_exclusion_mask)
     else:
         flattened = flatten_illumination(gray)
     blurred = cv2.GaussianBlur(flattened, (blur_size, blur_size), 0)
 
-    # ---- Otsu threshold, computed without the calibration line's pixels ----
-    # [reflected] THRESH_BINARY: aggregate is bright-on-dark.
-    # [backlight] THRESH_BINARY_INV: aggregate is dark-on-bright.
     if mode == 'BACKLIGHT':
         otsu_threshold, _ = cv2.threshold(
             blurred[line_exclusion_mask == 0], 0, 255,
@@ -1050,12 +793,10 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
         _, binary = cv2.threshold(blurred, otsu_threshold, 255, cv2.THRESH_BINARY)
     raw_foreground_fraction = float(np.count_nonzero(binary)) / (img_h * img_w)
 
-    # ---- Noise removal ----
     kernel = np.ones((morph_size, morph_size), np.uint8)
     opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
 
-    # ---- Exclude the calibration line's own region from the final result ----
     line_center_point = (int(lcx), int(lcy))
     pre_exclusion_contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for c in pre_exclusion_contours:
@@ -1063,14 +804,12 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
             cv2.drawContours(cleaned, [c], -1, 0, -1)
     cleaned[line_exclusion_mask == 255] = 0
 
-    # ---- Core contours + holes (the trusted, flattened-Otsu anchor) ----
     minimum_area_px = minimum_area_mm2_for_mode / mm2_per_px2
     confident_area_px = CONFIDENT_AREA_MM2 / mm2_per_px2
     borderline_area_px = BORDERLINE_AREA_MM2 / mm2_per_px2
     border_artifact_area_px = BORDER_ARTIFACT_AREA_FRACTION * img_h * img_w
     foreground_fraction = float(np.count_nonzero(cleaned)) / (img_h * img_w)
 
-    # ---- CLUSTER FLAGGING (shared as of V5.0 - see changelog) ----
     fragment_cluster_diagnostics = {'enabled': ENABLE_CLUSTER_FLAGGING, 'candidates': []}
     cleaned_for_core = cleaned
     cluster_seed_mask = np.zeros(gray.shape, dtype=np.uint8)
@@ -1099,7 +838,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
         'rejected_top5': rejected[:5],
     }
 
-    # ---- Hysteresis edge recovery ----
     qualifying_core_idx = {i for _, i in core_outer_contours}
     seed_mask = cleaned_for_core.copy()
     if core_hierarchy is not None:
@@ -1108,7 +846,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
             if parent_idx == -1 and i not in qualifying_core_idx:
                 cv2.drawContours(seed_mask, [contour], -1, 0, -1)
 
-    # ---- [reflected only] PROTOTYPE/EXPERIMENTAL local-contrast seed path ----
     local_contrast_diagnostics = {'enabled': ENABLE_LOCAL_CONTRAST_PROTOTYPE and mode == 'REFLECTED',
                                    'candidates': []}
     local_contrast_seed_mask = np.zeros(gray.shape, dtype=np.uint8)
@@ -1136,8 +873,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
     else:
         raw_background_mean, raw_background_std = float(gray.mean()), float(gray.std())
 
-    # [reflected] loose threshold looks for pixels BRIGHTER than background.
-    # [backlight] loose threshold looks for pixels DARKER than background.
     if mode == 'BACKLIGHT':
         loose_threshold = raw_background_mean - LOOSE_THRESHOLD_STD_MULTIPLIER * raw_background_std
         print(f"  Loose threshold (hysteresis, raw, darker-than-background): {loose_threshold:.1f}  "
@@ -1154,8 +889,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
     loose_mask[line_exclusion_mask == 255] = 0
     loose_mask[core_hole_mask == 255] = 0
 
-    # ---- [shared] Bubble exclusion: growth must never cross into a
-    # detected bubble - opt-in, default off for both modes (see changelog) ----
     bubble_pixel_count = 0
     if ENABLE_BUBBLE_EXCLUSION:
         bubble_mask = detect_bubble_mask(gray, seed_mask, line_exclusion_mask)
@@ -1165,7 +898,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
                   f"bubble, excluded from hysteresis growth")
         loose_mask[bubble_mask == 255] = 0
 
-    # ---- Growth distance cap ----
     growth_allowed_mask = build_growth_distance_cap(seed_mask)
     loose_mask[growth_allowed_mask == 0] = 0
 
@@ -1183,20 +915,17 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
         if cv2.pointPolygonTest(c, line_center_point, False) >= 0:
             cv2.drawContours(grown_mask, [c], -1, 0, -1)
 
-    # ---- Final contours + holes (core, possibly grown) ----
     (contours, hierarchy, outer_contours,
      hole_contours, small_indices, _) = classify_contours(
         grown_mask, minimum_area_px, confident_area_px, borderline_area_px,
         border_artifact_area_px, mm2_per_px2, collect_diagnostics=False)
 
-    # ---- Background mean intensity ----
     full_mask = np.zeros(gray.shape, dtype=np.uint8)
     for contour, _ in outer_contours:
         cv2.drawContours(full_mask, [contour], -1, 255, -1)
     background_pixels = gray[full_mask == 0]
     background_mean = float(background_pixels.mean()) if background_pixels.size > 0 else 0.0
 
-    # ---- Per-aggregate measurements ----
     measurements = []
     for i, (contour, contour_idx) in enumerate(outer_contours):
         outer_area_px = cv2.contourArea(contour)
@@ -1222,13 +951,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
         agg_pixels = gray[agg_mask == 255]
         aggregate_mean = float(agg_pixels.mean()) if agg_pixels.size > 0 else 0.0
 
-        # Cluster-origin corrections (shared as of V5.0 - see V4.14
-        # changelog in legacy/V4_hyesteresis.py for the full history of
-        # both the original bug and its fix): aggregate_mean/true_area_mm2
-        # both need bridge_only_mask (hull-fill pixels that were never real
-        # foreground) excluded, keeping every OTHER real foreground pixel
-        # regardless of whether it came from the clustered fragments or a
-        # separate merged-in blob.
         cluster_bridge_px_for_mean = int(np.count_nonzero((agg_mask == 255) & bridge_only_mask))
         if cluster_bridge_px_for_mean > 0:
             real_pixels = gray[(agg_mask == 255) & (~bridge_only_mask)]
@@ -1253,10 +975,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
             circularity = (4 * np.pi * true_area_px / (perimeter_px ** 2)
                            if perimeter_px > 0 else 0)
 
-        # [reflected]/[backlight] physics formulas kept genuinely separate -
-        # see V5.0 changelog. Both live on the measurement dict under their
-        # own mode-specific keys; display/CSV code reads whichever pair
-        # matches r['mode'].
         if mode == 'BACKLIGHT':
             safe_background = max(background_mean, 1e-6)
             relative_transmittance = min(1.0, max(1e-6, aggregate_mean / safe_background))
@@ -1370,7 +1088,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
             'volume_mm3': volume_mm3,
         })
 
-    # ---- Clean result image ----
     result_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
     final_mask = np.zeros(gray.shape, dtype=np.uint8)
@@ -1438,9 +1155,6 @@ def analyze_image(image, reference_mm, color_mode, thickness_mm, mode):
     }
 
 
-# =============================================
-# DISPLAY — single window, 2x2 grid
-# =============================================
 
 def compute_photo_summary(r):
     """[shared] avg_headline/total_combined hold whichever physics metric
@@ -1624,10 +1338,6 @@ def display_failure(reason, filename=None):
 
 
 def display_comparison_table(results, filenames):
-    # Header uses whichever mode the FIRST successful result used - a batch
-    # is expected to be run in one mode at a time (mode is a single popup
-    # selection for the whole batch), so this is representative for the
-    # whole table.
     batch_mode = next((r['mode'] for r in results if r.get('success')), 'REFLECTED')
     headline_label, combined_label = _headline_col_labels(batch_mode)
     col_labels = ['Photo', 'Scale\n(mm/px)', 'Area\n(mm2)', 'Core area\n(mm2)',
@@ -1733,9 +1443,6 @@ def display_comparison_table(results, filenames):
     plt.show()
 
 
-# =============================================
-# MAIN
-# =============================================
 
 if __name__ == "__main__":
     print("=" * 60)

@@ -2,10 +2,12 @@
 
 These files are earlier iterations of the plasma aggregation pipeline, kept for
 history rather than deleted. The canonical, current pipeline lives at
-[`../src/pipeline.py`](../src/pipeline.py). Backlit-photography runs currently
-go through `B1.py` in this folder; a separate `pipeline_backlight_variant.py`
-that once lived at `../src/` was abandoned (never updated past `VERSION =
-"B1.2"` while `B1.py` moved on to later versions) and has been moved to
+[`../Analysis Tools/Image_Analysis.py`](../Analysis%20Tools/Image_Analysis.py)
+(reflected-light and backlight modes merged into one file, see `v4_hyesteresis.py`
+and `B1.py` below for how each mode got there). A separate
+`pipeline_backlight_variant.py` that once lived at `../src/` was abandoned
+(never updated past `VERSION = "B1.2"` while `B1.py` moved on to later
+versions) and has been moved to
 [`../archive/pipeline_backlight_variant.py.OLD_DO_NOT_RUN`](../archive/pipeline_backlight_variant.py.OLD_DO_NOT_RUN).
 
 - `v1.py` → `v4_2.py` — sequential versions leading up to the current pipeline.
